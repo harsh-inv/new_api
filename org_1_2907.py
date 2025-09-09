@@ -5,7 +5,6 @@ from typing import Dict, List, Optional
 from datetime import datetime
 import statistics
 import os
-import pandas as pd
 import requests
 import sys
 import json
@@ -2377,3 +2376,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
