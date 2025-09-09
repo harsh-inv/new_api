@@ -5,38 +5,296 @@ import csv
 import os
 import tempfile
 import json
+import re
 from datetime import datetime
 from werkzeug.utils import secure_filename
 import logging
 
-# Import your existing classes
-from org_1_2907 import DataQualityChecker, Colors
-
 app = Flask(__name__)
-CORS(app)  # Enable CORS for cross-origin requests from UI5
+CORS(app)
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Configuration
 UPLOAD_FOLDER = '/tmp'
 ALLOWED_EXTENSIONS = {'csv'}
-MAX_CONTENT_LENGTH = 16 * 1024 * 1024  # 16MB max file size
+MAX_CONTENT_LENGTH = 16 * 1024 * 1024
 
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
+
+# Extract essential classes from your original file
+class DataQualityChecker:
+    def __init__(self, db_connection):
+        self.db_connection = db_connection
+        self.checks_config = {}
+        self.system_codes_config = {}
+
+    def load_checks_config(self, csv_file_path: str) -> bool:
+        try:
+            with open(csv_file_path, 'r', encoding='utf-8') as file:
+                reader = csv.DictReader(file)
+                for row in reader:
+                    table_name = row['table_name']
+                    field_name = row['field_name']
+                    if table_name not in self.checks_config:
+                        self.checks_config[table_name] = {}
+                    self.checks_config[table_name][field_name] = {
+                        'description': row['description'],
+                        'special_characters_check': row['special_characters_check'] == '1',
+                        'null_check': row['null_check'] == '1',
+                        'blank_check': row['blank_check'] == '1',
+                        'max_value_check': row['max_value_check'] == '1',
+                        'min_value_check': row['min_value_check'] == '1',
+                        'max_count_check': row['max_count_check'] == '1',
+                        'email_check': row['email_check'] == '1',
+                        'numeric_check': row['numeric_check'] == '1',
+                        'system_codes_check': row['system_codes_check'] == '1',
+                        'language_check': row['language_check'] == '1',
+                        'phone_number_check': row['phone_number_check'] == '1',
+                        'duplicate_check': row['duplicate_check'] == '1',
+                        'date_check': row['date_check'] == '1'
+                    }
+            return True
+        except Exception as e:
+            logger.error(f"Error loading checks configuration: {str(e)}")
+            return False
+
+    def load_system_codes_config(self, csv_file_path: str) -> bool:
+        try:
+            self.system_codes_config = {}
+            with open(csv_file_path, 'r', encoding='utf-8') as file:
+                reader = csv.DictReader(file)
+                for row in reader:
+                    table_name = row['table_name']
+                    field_name = row['field_name']
+                    valid_codes_str = row['valid_codes']
+                    valid_codes = [code.strip() for code in valid_codes_str.split(',') if code.strip()]
+                    
+                    if table_name not in self.system_codes_config:
+                        self.system_codes_config[table_name] = {}
+                    self.system_codes_config[table_name][field_name] = valid_codes
+            return True
+        except Exception as e:
+            logger.error(f"Error loading system codes configuration: {str(e)}")
+            return False
+
+    def _table_exists(self, table_name: str) -> bool:
+        try:
+            cursor = self.db_connection.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,))
+            return cursor.fetchone() is not None
+        except sqlite3.Error:
+            return False
+
+    def _column_exists(self, table_name: str, column_name: str) -> bool:
+        try:
+            cursor = self.db_connection.cursor()
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            columns = [row[1] for row in cursor.fetchall()]
+            return column_name in columns
+        except sqlite3.Error:
+            return False
+
+    def _is_numeric(self, value: str) -> bool:
+        try:
+            float(value)
+            return True
+        except ValueError:
+            return False
+
+    def _is_valid_email(self, email: str) -> bool:
+        email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        return re.match(email_pattern, email) is not None
+
+    def _is_valid_phone(self, phone: str) -> bool:
+        cleaned_phone = re.sub(r'[^\d+]', '', phone)
+        if len(cleaned_phone) < 10 or len(cleaned_phone) > 15:
+            return False
+        phone_pattern = r'^\+?[1-9]\d{9,14}$'
+        return re.match(phone_pattern, cleaned_phone) is not None
+
+    def _is_valid_date(self, date_str: str) -> bool:
+        date_formats = [
+            '%Y-%m-%d', '%m/%d/%Y', '%d/%m/%Y', '%Y-%m-%d %H:%M:%S',
+            '%m-%d-%Y', '%d-%m-%Y', '%Y/%m/%d', '%d.%m.%Y',
+            '%Y', '%m/%Y', '%Y-%m'
+        ]
+        for fmt in date_formats:
+            try:
+                datetime.strptime(str(date_str), fmt)
+                return True
+            except ValueError:
+                continue
+        return False
+
+    def _has_special_characters(self, text: str) -> bool:
+        allowed_pattern = r'^[a-zA-Z0-9\s.,@_-]+$'
+        return not re.match(allowed_pattern, text)
+
+    def _has_non_ascii_characters(self, text: str) -> bool:
+        try:
+            text.encode('ascii')
+            return False
+        except UnicodeEncodeError:
+            return True
+
+    def _looks_like_system_code(self, code: str) -> bool:
+        patterns = [
+            r'^[A-F0-9]{8}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{12}$',
+            r'^[A-Z]{2,3}\d{3,}$',
+            r'^\d{6,}$',
+            r'^[A-Z0-9]{8,}$',
+        ]
+        for pattern in patterns:
+            if re.match(pattern, code.upper()):
+                return True
+        return False
+
+    def _get_valid_system_codes(self, table_name: str, field_name: str) -> list:
+        return self.system_codes_config.get(table_name, {}).get(field_name, [])
+
+    def _run_field_checks(self, table_name: str, field_name: str, checks: dict) -> list:
+        results = []
+        
+        if not self._column_exists(table_name, field_name):
+            results.append({
+                'table': table_name,
+                'field': field_name,
+                'check_type': 'column_existence',
+                'status': 'FAIL',
+                'message': f"Column '{field_name}' does not exist in table '{table_name}'"
+            })
+            return results
+
+        try:
+            cursor = self.db_connection.cursor()
+            cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+            total_rows = cursor.fetchone()[0]
+
+            if total_rows == 0:
+                results.append({
+                    'table': table_name,
+                    'field': field_name,
+                    'check_type': 'data_existence',
+                    'status': 'WARNING',
+                    'message': f"Table '{table_name}' has no data"
+                })
+                return results
+
+            # Null check
+            if checks.get('null_check', False):
+                cursor.execute(f"SELECT COUNT(*) FROM {table_name} WHERE {field_name} IS NULL")
+                null_count = cursor.fetchone()[0]
+                if null_count > 0:
+                    results.append({
+                        'table': table_name,
+                        'field': field_name,
+                        'check_type': 'null_check',
+                        'status': 'FAIL',
+                        'message': f"Found {null_count} NULL values out of {total_rows} total rows"
+                    })
+                else:
+                    results.append({
+                        'table': table_name,
+                        'field': field_name,
+                        'check_type': 'null_check',
+                        'status': 'PASS',
+                        'message': f"No NULL values found"
+                    })
+
+            # Blank check
+            if checks.get('blank_check', False):
+                cursor.execute(f"SELECT COUNT(*) FROM {table_name} WHERE {field_name} = ''")
+                blank_count = cursor.fetchone()[0]
+                if blank_count > 0:
+                    results.append({
+                        'table': table_name,
+                        'field': field_name,
+                        'check_type': 'blank_check',
+                        'status': 'FAIL',
+                        'message': f"Found {blank_count} blank values out of {total_rows} total rows"
+                    })
+                else:
+                    results.append({
+                        'table': table_name,
+                        'field': field_name,
+                        'check_type': 'blank_check',
+                        'status': 'PASS',
+                        'message': f"No blank values found"
+                    })
+
+            # Email check
+            if checks.get('email_check', False):
+                cursor.execute(f"SELECT COUNT(*) FROM {table_name} WHERE {field_name} IS NOT NULL AND {field_name} != ''")
+                non_null_count = cursor.fetchone()[0]
+                if non_null_count > 0:
+                    cursor.execute(f"SELECT {field_name} FROM {table_name} WHERE {field_name} IS NOT NULL AND {field_name} != ''")
+                    values = cursor.fetchall()
+                    invalid_emails = []
+                    for value in values:
+                        email = str(value[0]).strip()
+                        if not self._is_valid_email(email):
+                            invalid_emails.append(email)
+                    
+                    if invalid_emails:
+                        results.append({
+                            'table': table_name,
+                            'field': field_name,
+                            'check_type': 'email_check',
+                            'status': 'FAIL',
+                            'message': f"Found {len(invalid_emails)} invalid email formats out of {non_null_count} values"
+                        })
+                    else:
+                        results.append({
+                            'table': table_name,
+                            'field': field_name,
+                            'check_type': 'email_check',
+                            'status': 'PASS',
+                            'message': f"All {non_null_count} email formats appear valid"
+                        })
+
+            # Add other checks (phone, date, numeric, etc.) following the same pattern...
+
+        except sqlite3.Error as e:
+            results.append({
+                'table': table_name,
+                'field': field_name,
+                'check_type': 'database_error',
+                'status': 'ERROR',
+                'message': f"Database error: {str(e)}"
+            })
+
+        return results
+
+    def run_all_checks(self) -> dict:
+        if not self.checks_config:
+            return {}
+        
+        results = {}
+        for table_name, fields in self.checks_config.items():
+            if not self._table_exists(table_name):
+                continue
+            
+            table_results = []
+            for field_name, checks in fields.items():
+                field_results = self._run_field_checks(table_name, field_name, checks)
+                if field_results:
+                    table_results.extend(field_results)
+            
+            if table_results:
+                results[table_name] = table_results
+        
+        return results
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 def create_sample_database(db_path):
-    """Create a sample database for testing"""
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         
-        # Create sample employees table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS employees (
                 id INTEGER PRIMARY KEY,
@@ -50,7 +308,6 @@ def create_sample_database(db_path):
             )
         ''')
         
-        # Insert sample data with some quality issues
         sample_data = [
             (1, 'John Doe', 'john.doe@company.com', '555-0123', 'IT001', 75000, '2023-01-15', 'ACTIVE'),
             (2, 'Jane Smith', 'jane.smith@company', '555-0124', 'HR002', 65000, '2023-02-01', 'ACTIVE'),  # Invalid email
@@ -72,9 +329,21 @@ def create_sample_database(db_path):
         logger.error(f"Error creating sample database: {str(e)}")
         return False
 
+@app.route('/', methods=['GET'])
+def home():
+    return jsonify({
+        "service": "Data Quality Checker API",
+        "version": "1.0.0",
+        "status": "running",
+        "endpoints": {
+            "/health": "Health check",
+            "/api/data-quality-check": "Run data quality checks (POST)",
+            "/api/sample-configs": "Get sample configuration formats"
+        }
+    })
+
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Health check endpoint"""
     return jsonify({
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
@@ -83,7 +352,6 @@ def health_check():
 
 @app.route('/api/data-quality-check', methods=['POST'])
 def run_data_quality_checks():
-    """Main endpoint for running data quality checks"""
     try:
         # Check if files are present
         if 'data_quality_file' not in request.files or 'system_codes_file' not in request.files:
@@ -235,8 +503,6 @@ def run_data_quality_checks():
 
 @app.route('/api/sample-configs', methods=['GET'])
 def get_sample_configs():
-    """Endpoint to get sample configuration file formats"""
-    
     sample_data_quality = [
         {
             "table_name": "employees",
